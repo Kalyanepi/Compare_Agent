@@ -17581,3 +17581,1894 @@ requests
 Start
 cd "$HOME/autonomous-platform-docker"
 docker compose up --build
+
+level6
+Final folder structure
+level6-control-plane/
+├── .env
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── prometheus.yml
+├── backend/
+│   └── main.py
+├── frontend/
+│   └── Home.py
+├── scripts/
+│   ├── start_backend.sh
+│   ├── start_frontend.sh
+│   ├── worker_loop.sh
+│   └── package.sh
+├── k8s/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── hpa.yaml
+│   └── servicemonitor.yaml
+└── argo/
+    └── application.yaml
+``
+.env
+ENV=production
+BACKEND_URL=http://backend:8000
+
+SESSION_SECRET=level6-control-plane-secret
+SESSION_EXP_MINUTES=480
+
+AUTO_APPROVE_LOW=true
+ENABLE_REAL_REMEDIATION=false
+DEFAULT_NAMESPACE=default
+
+CPU_THRESHOLD=85
+ERROR_RATE_THRESHOLD=5
+LATENCY_MS_THRESHOLD=1500
+
+DATABASE_URL=postgresql+psycopg2://autonomous:autonomous@postgres:5432/autonomous
+REDIS_URL=redis://redis:6379/0
+
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_TOPIC_TELEMETRY=autonomous-telemetry
+
+ARGOCD_ENABLED=false
+ARGOCD_SERVER=http://argocd-server:8080
+ARGOCD_APP=policy-compare
+
+STRUCTURED_LOG_FILE=logs/app.jsonl
+
+requirements.txt
+fastapi
+uvicorn
+streamlit
+requests
+pandas
+numpy
+prometheus-client
+PyJWT
+python-multipart
+SQLAlchemy
+psycopg2-binary
+redis
+kafka-python
+
+backend/main.py
+import json
+import logging
+import os
+import subprocess
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import jwt
+import numpy as np
+import pandas as pd
+import redis
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from kafka import KafkaProducer
+from pydantic import BaseModel, Field
+from prometheus_client import Counter, Histogram, generate_latest
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    func,
+)
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+APP_TITLE = "Level 6 Enterprise Control Plane"
+APP_VERSION = "6.0.0"
+
+# -------------------------------------------------------------------
+# ENV / CONFIG
+# -------------------------------------------------------------------
+SESSION_SECRET = os.getenv("SESSION_SECRET", "level6-control-plane-secret")
+SESSION_EXP_MINUTES = int(os.getenv("SESSION_EXP_MINUTES", "480"))
+
+AUTO_APPROVE_LOW = os.getenv("AUTO_APPROVE_LOW", "true").lower() == "true"
+ENABLE_REAL_REMEDIATION = os.getenv("ENABLE_REAL_REMEDIATION", "false").lower() == "true"
+DEFAULT_NAMESPACE = os.getenv("DEFAULT_NAMESPACE", "default")
+
+CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", "85"))
+ERROR_RATE_THRESHOLD = float(os.getenv("ERROR_RATE_THRESHOLD", "5"))
+LATENCY_MS_THRESHOLD = float(os.getenv("LATENCY_MS_THRESHOLD", "1500"))
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://autonomous:autonomous@postgres:5432/autonomous")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+KAFKA_ENABLED = os.getenv("KAFKA_ENABLED", "true").lower() == "true"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC_TELEMETRY = os.getenv("KAFKA_TOPIC_TELEMETRY", "autonomous-telemetry")
+
+ARGOCD_ENABLED = os.getenv("ARGOCD_ENABLED", "false").lower() == "true"
+ARGOCD_SERVER = os.getenv("ARGOCD_SERVER", "http://argocd-server:8080")
+ARGOCD_APP = os.getenv("ARGOCD_APP", "policy-compare")
+
+STRUCTURED_LOG_FILE = os.getenv("STRUCTURED_LOG_FILE", "logs/app.jsonl")
+os.makedirs("logs", exist_ok=True)
+
+# -------------------------------------------------------------------
+# STRUCTURED LOGGING
+# -------------------------------------------------------------------
+logger = logging.getLogger("control-plane")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+
+file_handler = logging.FileHandler(STRUCTURED_LOG_FILE)
+file_handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(file_handler)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(stream_handler)
+
+def jlog(event_type: str, actor: str, details: Dict):
+    logger.info(
+        json.dumps(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "event_type": event_type,
+                "actor": actor,
+                "details": details,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+# -------------------------------------------------------------------
+# METRICS
+# -------------------------------------------------------------------
+REQUEST_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"])
+REQUEST_LATENCY = Histogram("http_request_duration_seconds", "Request latency seconds", ["endpoint"])
+
+AUTONOMOUS_EVALUATIONS = Counter("autonomous_evaluations_total", "Autonomous evaluation cycles")
+INCIDENTS_RAISED = Counter("autonomous_incidents_total", "Incidents raised by severity", ["severity"])
+ACTIONS_CREATED = Counter("autonomous_actions_total", "Actions created by type", ["action_type"])
+ACTIONS_EXECUTED = Counter("autonomous_actions_executed_total", "Actions executed by result", ["result"])
+SIMULATIONS_RUN = Counter("autonomous_simulations_total", "Simulations run by action type", ["action_type"])
+
+# -------------------------------------------------------------------
+# USERS / ROLES
+# -------------------------------------------------------------------
+DEMO_USERS = {
+    "admin": "admin",
+    "reviewer": "compliance_reviewer",
+    "operator": "operator",
+    "viewer": "viewer",
+}
+
+# -------------------------------------------------------------------
+# AUTH
+# -------------------------------------------------------------------
+def create_token(user: str, role: str) -> str:
+    payload = {
+        "sub": user,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(minutes=SESSION_EXP_MINUTES),
+    }
+    return jwt.encode(payload, SESSION_SECRET, algorithm="HS256")
+
+def decode_token(token: str) -> Dict:
+    try:
+        return jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+def require_session(x_session_token: Optional[str] = Header(default=None)) -> Dict:
+    if not x_session_token:
+        raise HTTPException(status_code=401, detail="Missing X-Session-Token")
+    return decode_token(x_session_token)
+
+def require_roles(session: Dict, roles: List[str]):
+    if session["role"] not in roles:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+# -------------------------------------------------------------------
+# DB
+# -------------------------------------------------------------------
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+class Telemetry(Base):
+    __tablename__ = "telemetry"
+    id = Column(Integer, primary_key=True)
+    service = Column(String(255), nullable=False)
+    metric_name = Column(String(255), nullable=False)
+    metric_value = Column(Float, nullable=False)
+    ts = Column(String(64), nullable=False)
+
+class Incident(Base):
+    __tablename__ = "incidents"
+    id = Column(Integer, primary_key=True)
+    service = Column(String(255), nullable=False)
+    incident_type = Column(String(255), nullable=False)
+    severity = Column(String(32), nullable=False)
+    evidence_json = Column(Text, nullable=False)
+    diagnosis = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False)
+    created_at = Column(String(64), nullable=False)
+    closed_at = Column(String(64), nullable=True)
+    actions = relationship("Action", back_populates="incident")
+
+class Action(Base):
+    __tablename__ = "actions"
+    id = Column(Integer, primary_key=True)
+    incident_id = Column(Integer, ForeignKey("incidents.id"), nullable=False)
+    service = Column(String(255), nullable=False)
+    action_type = Column(String(255), nullable=False)
+    parameters_json = Column(Text, nullable=False)
+    approval_required = Column(Boolean, nullable=False)
+    approval_status = Column(String(32), nullable=False)
+    execution_status = Column(String(32), nullable=False)
+    created_at = Column(String(64), nullable=False)
+    reviewed_by = Column(String(255), nullable=True)
+    reviewed_at = Column(String(64), nullable=True)
+    executed_by = Column(String(255), nullable=True)
+    executed_at = Column(String(64), nullable=True)
+    result_json = Column(Text, nullable=True)
+    simulation_json = Column(Text, nullable=True)
+    incident = relationship("Incident", back_populates="actions")
+
+class LearningFeedback(Base):
+    __tablename__ = "learning_feedback"
+    id = Column(Integer, primary_key=True)
+    service = Column(String(255), nullable=False)
+    incident_type = Column(String(255), nullable=False)
+    action_type = Column(String(255), nullable=False)
+    outcome = Column(String(32), nullable=False)  # success/failure/manual_override
+    confidence = Column(Float, nullable=False)
+    notes = Column(Text, nullable=False)
+    created_at = Column(String(64), nullable=False)
+
+Base.metadata.create_all(bind=engine)
+
+# -------------------------------------------------------------------
+# REDIS / KAFKA
+# -------------------------------------------------------------------
+redis_client = None
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+except Exception:
+    redis_client = None
+
+producer = None
+if KAFKA_ENABLED:
+    try:
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+    except Exception:
+        producer = None
+
+# -------------------------------------------------------------------
+# REQUEST MODELS
+# -------------------------------------------------------------------
+class TelemetryIn(BaseModel):
+    service: str = Field(..., min_length=1)
+    metric_name: str = Field(..., min_length=1)
+    metric_value: float
+    ts: Optional[str] = None
+
+class BulkTelemetryIn(BaseModel):
+    items: List[TelemetryIn]
+
+class ApprovalIn(BaseModel):
+    decision: str = Field(..., pattern="^(approved|rejected)$")
+    comment: str = ""
+
+class ExecuteIn(BaseModel):
+    force: bool = False
+
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def insert_telemetry(item: TelemetryIn):
+    db = SessionLocal()
+    db.add(
+        Telemetry(
+            service=item.service,
+            metric_name=item.metric_name,
+            metric_value=item.metric_value,
+            ts=item.ts or now_iso(),
+        )
+    )
+    db.commit()
+    db.close()
+
+    if producer is not None:
+        producer.send(KAFKA_TOPIC_TELEMETRY, item.model_dump())
+        producer.flush()
+
+def fetch_recent_telemetry(minutes: int = 240) -> pd.DataFrame:
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    db = SessionLocal()
+    rows = db.query(Telemetry).all()
+    db.close()
+
+    data = [
+        {
+            "id": r.id,
+            "service": r.service,
+            "metric_name": r.metric_name,
+            "metric_value": r.metric_value,
+            "ts": r.ts,
+        }
+        for r in rows
+        if datetime.fromisoformat(r.ts) >= cutoff
+    ]
+    return pd.DataFrame(data)
+
+def unresolved_incident_exists(service: str, incident_type: str) -> bool:
+    db = SessionLocal()
+    row = (
+        db.query(Incident)
+        .filter(
+            Incident.service == service,
+            Incident.incident_type == incident_type,
+            Incident.status.in_(["open", "under_review"]),
+        )
+        .order_by(Incident.id.desc())
+        .first()
+    )
+    db.close()
+    return row is not None
+
+def create_incident(service: str, incident_type: str, severity: str, evidence: Dict, diagnosis: str) -> int:
+    db = SessionLocal()
+    obj = Incident(
+        service=service,
+        incident_type=incident_type,
+        severity=severity,
+        evidence_json=json.dumps(evidence),
+        diagnosis=diagnosis,
+        status="open",
+        created_at=now_iso(),
+        closed_at=None,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    db.close()
+    INCIDENTS_RAISED.labels(severity=severity).inc()
+    return obj.id
+
+def create_action(incident_id: int, service: str, action_type: str, parameters: Dict, approval_required: bool, simulation: Dict) -> int:
+    db = SessionLocal()
+    obj = Action(
+        incident_id=incident_id,
+        service=service,
+        action_type=action_type,
+        parameters_json=json.dumps(parameters),
+        approval_required=approval_required,
+        approval_status="approved" if not approval_required else "pending",
+        execution_status="ready" if not approval_required else "awaiting_approval",
+        created_at=now_iso(),
+        simulation_json=json.dumps(simulation),
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    db.close()
+    ACTIONS_CREATED.labels(action_type=action_type).inc()
+    return obj.id
+
+def list_incidents() -> List[Dict]:
+    db = SessionLocal()
+    rows = db.query(Incident).order_by(Incident.id.desc()).all()
+    db.close()
+    return [
+        {
+            "id": r.id,
+            "service": r.service,
+            "incident_type": r.incident_type,
+            "severity": r.severity,
+            "evidence": json.loads(r.evidence_json),
+            "diagnosis": r.diagnosis,
+            "status": r.status,
+            "created_at": r.created_at,
+            "closed_at": r.closed_at,
+        }
+        for r in rows
+    ]
+
+def list_actions() -> List[Dict]:
+    db = SessionLocal()
+    rows = db.query(Action).order_by(Action.id.desc()).all()
+    db.close()
+    return [
+        {
+            "id": r.id,
+            "incident_id": r.incident_id,
+            "service": r.service,
+            "action_type": r.action_type,
+            "parameters": json.loads(r.parameters_json),
+            "approval_required": r.approval_required,
+            "approval_status": r.approval_status,
+            "execution_status": r.execution_status,
+            "created_at": r.created_at,
+            "reviewed_by": r.reviewed_by,
+            "reviewed_at": r.reviewed_at,
+            "executed_by": r.executed_by,
+            "executed_at": r.executed_at,
+            "result": json.loads(r.result_json) if r.result_json else {},
+            "simulation": json.loads(r.simulation_json) if r.simulation_json else {},
+        }
+        for r in rows
+    ]
+
+def update_action_approval(action_id: int, reviewer: str, decision: str, comment: str):
+    db = SessionLocal()
+    row = db.query(Action).filter(Action.id == action_id).first()
+    if not row:
+        db.close()
+        raise HTTPException(status_code=404, detail="Action not found")
+    row.approval_status = decision
+    row.execution_status = "ready" if decision == "approved" else "cancelled"
+    row.reviewed_by = reviewer
+    row.reviewed_at = now_iso()
+    row.result_json = json.dumps({"review_comment": comment})
+    db.commit()
+    db.close()
+
+def update_action_execution(action_id: int, executor: str, status: str, result: Dict):
+    db = SessionLocal()
+    row = db.query(Action).filter(Action.id == action_id).first()
+    if not row:
+        db.close()
+        raise HTTPException(status_code=404, detail="Action not found")
+    row.execution_status = status
+    row.executed_by = executor
+    row.executed_at = now_iso()
+    row.result_json = json.dumps(result)
+    db.commit()
+    db.close()
+
+def close_incident(incident_id: int):
+    db = SessionLocal()
+    row = db.query(Incident).filter(Incident.id == incident_id).first()
+    if row:
+        row.status = "closed"
+        row.closed_at = now_iso()
+        db.commit()
+    db.close()
+
+def record_learning(service: str, incident_type: str, action_type: str, outcome: str, confidence: float, notes: str):
+    db = SessionLocal()
+    db.add(
+        LearningFeedback(
+            service=service,
+            incident_type=incident_type,
+            action_type=action_type,
+            outcome=outcome,
+            confidence=confidence,
+            notes=notes,
+            created_at=now_iso(),
+        )
+    )
+    db.commit()
+    db.close()
+
+def get_action_success_rate(service: str, incident_type: str, action_type: str) -> float:
+    db = SessionLocal()
+    total = (
+        db.query(func.count(LearningFeedback.id))
+        .filter(
+            LearningFeedback.service == service,
+            LearningFeedback.incident_type == incident_type,
+            LearningFeedback.action_type == action_type,
+        )
+        .scalar()
+    )
+    success = (
+        db.query(func.count(LearningFeedback.id))
+        .filter(
+            LearningFeedback.service == service,
+            LearningFeedback.incident_type == incident_type,
+            LearningFeedback.action_type == action_type,
+            LearningFeedback.outcome == "success",
+        )
+        .scalar()
+    )
+    db.close()
+    if not total:
+        return 0.5
+    return round(success / total, 3)
+
+def rolling_zscore(values: List[float]) -> float:
+    arr = np.array(values, dtype=float)
+    if len(arr) < 3:
+        return 0.0
+    baseline = arr[:-1]
+    std = np.std(baseline)
+    if std == 0:
+        return 0.0
+    return float((arr[-1] - np.mean(baseline)) / (std + 1e-9))
+
+# -------------------------------------------------------------------
+# GOVERNANCE LAYER
+# -------------------------------------------------------------------
+class GovernancePolicy:
+    @staticmethod
+    def requires_approval(severity: str, action_type: str) -> bool:
+        if action_type == "rollback_release":
+            return True
+        if severity in ["medium", "high"]:
+            return True
+        if severity == "low" and AUTO_APPROVE_LOW:
+            return False
+        return True
+
+# -------------------------------------------------------------------
+# LEARNING LAYER
+# -------------------------------------------------------------------
+class LearningEngine:
+    ACTION_CANDIDATES = {
+        "cpu_saturation": ["scale_up"],
+        "error_rate_spike": ["restart_service", "rollback_release"],
+        "latency_degradation": ["scale_up", "restart_service"],
+        "release_regression_suspected": ["rollback_release", "restart_service"],
+    }
+
+    @staticmethod
+    def choose_action(service: str, incident_type: str) -> str:
+        candidates = LearningEngine.ACTION_CANDIDATES.get(incident_type, ["observe_only"])
+        scored = [(a, get_action_success_rate(service, incident_type, a)) for a in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[0][0]
+
+# -------------------------------------------------------------------
+# SIMULATION LAYER
+# -------------------------------------------------------------------
+class SimulationEngine:
+    @staticmethod
+    def simulate(action_type: str, incident_type: str, evidence: Dict, service: str) -> Dict:
+        SIMULATIONS_RUN.labels(action_type=action_type).inc()
+
+        predicted_delta = {}
+        confidence = get_action_success_rate(service, incident_type, action_type)
+
+        if action_type == "scale_up":
+            predicted_delta = {"cpu_percent": -15, "latency_ms": -300}
+        elif action_type == "restart_service":
+            predicted_delta = {"error_rate": -4, "latency_ms": -150}
+        elif action_type == "rollback_release":
+            predicted_delta = {"error_rate": -7, "latency_ms": -500}
+
+        risk = "low" if confidence >= 0.7 else "medium" if confidence >= 0.5 else "high"
+
+        return {
+            "simulation_mode": "deterministic",
+            "confidence": confidence,
+            "predicted_delta": predicted_delta,
+            "risk_after_action": risk,
+            "simulated_at": now_iso(),
+        }
+
+# -------------------------------------------------------------------
+# ABSTRACTION LAYER
+# -------------------------------------------------------------------
+class BaseExecutor:
+    def execute(self, action: Dict) -> Dict:
+        raise NotImplementedError
+
+class NoopExecutor(BaseExecutor):
+    def execute(self, action: Dict) -> Dict:
+        return {
+            "mode": "dry_run",
+            "success": True,
+            "message": f"Simulated {action['action_type']} for {action['service']}",
+            "parameters": action["parameters"],
+        }
+
+class K8sExecutor(BaseExecutor):
+    def _run(self, cmd: List[str]) -> Dict:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return {"success": True, "stdout": proc.stdout, "stderr": proc.stderr, "cmd": cmd}
+        except subprocess.CalledProcessError as e:
+            return {"success": False, "stdout": e.stdout, "stderr": e.stderr, "cmd": cmd}
+
+    def execute(self, action: Dict) -> Dict:
+        action_type = action["action_type"]
+        params = action["parameters"]
+        deployment = params.get("deployment", "")
+        namespace = params.get("namespace", DEFAULT_NAMESPACE)
+
+        if action_type == "restart_service":
+            return self._run(["kubectl", "rollout", "restart", f"deployment/{deployment}", "-n", namespace])
+
+        if action_type == "rollback_release":
+            return self._run(["kubectl", "rollout", "undo", f"deployment/{deployment}", "-n", namespace])
+
+        if action_type == "scale_up":
+            current = self._run(["kubectl", "get", f"deployment/{deployment}", "-n", namespace, "-o", "jsonpath={.spec.replicas}"])
+            if not current["success"]:
+                return current
+            desired = int(current["stdout"] or "1") + int(params.get("replicas_delta", 1))
+            return self._run(["kubectl", "scale", f"deployment/{deployment}", f"--replicas={desired}", "-n", namespace])
+
+        return {"mode": "noop", "success": False, "message": f"Unsupported action {action_type}"}
+
+def get_executor() -> BaseExecutor:
+    return K8sExecutor() if ENABLE_REAL_REMEDIATION else NoopExecutor()
+
+def enqueue_action(action_id: int):
+    if redis_client is None:
+        raise HTTPException(status_code=500, detail="Redis not available")
+    redis_client.rpush("autonomous:actions", json.dumps({"action_id": action_id}))
+
+def process_one_queue_item(actor: str = "worker") -> Dict:
+    if redis_client is None:
+        return {"status": "redis_unavailable"}
+
+    raw = redis_client.lpop("autonomous:actions")
+    if not raw:
+        return {"status": "empty"}
+
+    payload = json.loads(raw)
+    action_id = int(payload["action_id"])
+    target = next((a for a in list_actions() if a["id"] == action_id), None)
+
+    if not target:
+        return {"status": "missing_action", "action_id": action_id}
+
+    if target["approval_required"] and target["approval_status"] != "approved":
+        return {"status": "not_approved", "action_id": action_id}
+
+    result = get_executor().execute(target)
+    status = "executed" if result.get("success") else "failed"
+
+    update_action_execution(action_id, actor, status, result)
+    ACTIONS_EXECUTED.labels(result=status).inc()
+
+    outcome = "success" if status == "executed" else "failure"
+    record_learning(
+        service=target["service"],
+        incident_type=next((i["incident_type"] for i in list_incidents() if i["id"] == target["incident_id"]), "unknown"),
+        action_type=target["action_type"],
+        outcome=outcome,
+        confidence=float(target["simulation"].get("confidence", 0.5)),
+        notes="queued execution result",
+    )
+
+    if status == "executed":
+        close_incident(target["incident_id"])
+
+    jlog("action_processed_from_queue", actor, {"action_id": action_id, "status": status})
+    return {"status": status, "action_id": action_id, "result": result}
+
+# -------------------------------------------------------------------
+# ANOMALY DETECTION
+# -------------------------------------------------------------------
+def classify_service(service_df: pd.DataFrame) -> List[Dict]:
+    service = service_df["service"].iloc[0]
+    incidents = []
+
+    cpu_series = service_df[service_df["metric_name"] == "cpu_percent"]["metric_value"].tolist()
+    err_series = service_df[service_df["metric_name"] == "error_rate"]["metric_value"].tolist()
+    lat_series = service_df[service_df["metric_name"] == "latency_ms"]["metric_value"].tolist()
+
+    cpu = cpu_series[-1] if cpu_series else None
+    err = err_series[-1] if err_series else None
+    lat = lat_series[-1] if lat_series else None
+
+    cpu_z = rolling_zscore(cpu_series) if cpu_series else 0.0
+    err_z = rolling_zscore(err_series) if err_series else 0.0
+    lat_z = rolling_zscore(lat_series) if lat_series else 0.0
+
+    if cpu is not None and (cpu >= CPU_THRESHOLD or cpu_z >= 2.5):
+        incidents.append({
+            "service": service,
+            "incident_type": "cpu_saturation",
+            "severity": "low" if cpu < 95 else "medium",
+            "evidence": {"cpu_percent": cpu, "cpu_zscore": round(cpu_z, 2), "threshold": CPU_THRESHOLD},
+            "diagnosis": f"CPU saturation detected for {service}",
+        })
+
+    if err is not None and (err >= ERROR_RATE_THRESHOLD or err_z >= 2.5):
+        incidents.append({
+            "service": service,
+            "incident_type": "error_rate_spike",
+            "severity": "medium" if err < 10 else "high",
+            "evidence": {"error_rate": err, "error_zscore": round(err_z, 2), "threshold": ERROR_RATE_THRESHOLD},
+            "diagnosis": f"Error-rate spike detected for {service}",
+        })
+
+    if lat is not None and (lat >= LATENCY_MS_THRESHOLD or lat_z >= 2.5):
+        incidents.append({
+            "service": service,
+            "incident_type": "latency_degradation",
+            "severity": "low" if lat < 2500 else "medium",
+            "evidence": {"latency_ms": lat, "latency_zscore": round(lat_z, 2), "threshold": LATENCY_MS_THRESHOLD},
+            "diagnosis": f"Latency degradation detected for {service}",
+        })
+
+    if err is not None and lat is not None and err >= ERROR_RATE_THRESHOLD and lat >= LATENCY_MS_THRESHOLD:
+        incidents.append({
+            "service": service,
+            "incident_type": "release_regression_suspected",
+            "severity": "high",
+            "evidence": {"error_rate": err, "latency_ms": lat},
+            "diagnosis": f"Combined error-rate and latency regression suspected for {service}",
+        })
+
+    return incidents
+
+def build_action_plan(incident: Dict) -> Tuple[str, Dict]:
+    action_type = LearningEngine.choose_action(incident["service"], incident["incident_type"])
+    parameters = {"deployment": incident["service"], "namespace": DEFAULT_NAMESPACE}
+
+    if action_type == "scale_up":
+        parameters["replicas_delta"] = 1
+
+    simulation = SimulationEngine.simulate(
+        action_type=action_type,
+        incident_type=incident["incident_type"],
+        evidence=incident["evidence"],
+        service=incident["service"],
+    )
+
+    return action_type, {
+        "parameters": parameters,
+        "approval_required": GovernancePolicy.requires_approval(incident["severity"], action_type),
+        "simulation": simulation,
+    }
+
+# -------------------------------------------------------------------
+# FastAPI app
+# -------------------------------------------------------------------
+app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=response.status_code).inc()
+    REQUEST_LATENCY.labels(endpoint=request.url.path).observe(duration)
+    return response
+
+@app.get("/auth/login/{user}")
+def login(user: str):
+    role = DEMO_USERS.get(user)
+    if not role:
+        raise HTTPException(status_code=404, detail="User not found")
+    token = create_token(user, role)
+    jlog("login", user, {"role": role})
+    return {"token": token, "user": user, "role": role}
+
+@app.get("/auth/me")
+def me(session: Dict = Depends(require_session)):
+    return {"user": session["sub"], "role": session["role"]}
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "mode": "level6_enterprise_control_plane",
+        "real_remediation_enabled": ENABLE_REAL_REMEDIATION,
+        "redis_available": redis_client is not None,
+        "kafka_enabled": KAFKA_ENABLED and producer is not None,
+        "database_url": DATABASE_URL,
+    }
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type="text/plain")
+
+@app.post("/telemetry")
+def ingest_telemetry(item: TelemetryIn, session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    insert_telemetry(item)
+    jlog("telemetry_ingest", session["sub"], item.model_dump())
+    return {"status": "ingested"}
+
+@app.post("/telemetry/bulk")
+def ingest_bulk(payload: BulkTelemetryIn, session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    for item in payload.items:
+        insert_telemetry(item)
+    jlog("telemetry_bulk_ingest", session["sub"], {"count": len(payload.items)})
+    return {"status": "ingested", "count": len(payload.items)}
+
+@app.post("/telemetry/sample")
+def telemetry_sample(session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator"])
+    rows = [
+        TelemetryIn(service="orders-api", metric_name="cpu_percent", metric_value=91),
+        TelemetryIn(service="orders-api", metric_name="error_rate", metric_value=7),
+        TelemetryIn(service="orders-api", metric_name="latency_ms", metric_value=2200),
+        TelemetryIn(service="billing-worker", metric_name="cpu_percent", metric_value=62),
+        TelemetryIn(service="billing-worker", metric_name="error_rate", metric_value=1),
+        TelemetryIn(service="billing-worker", metric_name="latency_ms", metric_value=420),
+        TelemetryIn(service="claims-service", metric_name="cpu_percent", metric_value=87),
+        TelemetryIn(service="claims-service", metric_name="error_rate", metric_value=0.5),
+        TelemetryIn(service="claims-service", metric_name="latency_ms", metric_value=1600),
+    ]
+    for row in rows:
+        insert_telemetry(row)
+    jlog("telemetry_sample_generated", session["sub"], {"count": len(rows)})
+    return {"status": "generated", "count": len(rows)}
+
+@app.get("/telemetry/recent")
+def telemetry_recent(session: Dict = Depends(require_session)):
+    df = fetch_recent_telemetry()
+    return df.to_dict(orient="records")
+
+@app.post("/autonomous/evaluate")
+def autonomous_evaluate(session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    AUTONOMOUS_EVALUATIONS.inc()
+
+    df = fetch_recent_telemetry()
+    if df.empty:
+        return {"status": "no_data", "created_incidents": 0, "created_actions": 0}
+
+    created_incidents = 0
+    created_actions = 0
+
+    for service, service_df in df.groupby("service"):
+        incidents = classify_service(service_df)
+        for incident in incidents:
+            if unresolved_incident_exists(service, incident["incident_type"]):
+                continue
+
+            incident_id = create_incident(
+                incident["service"],
+                incident["incident_type"],
+                incident["severity"],
+                incident["evidence"],
+                incident["diagnosis"],
+            )
+            created_incidents += 1
+
+            action_type, plan = build_action_plan(incident)
+            create_action(
+                incident_id=incident_id,
+                service=incident["service"],
+                action_type=action_type,
+                parameters=plan["parameters"],
+                approval_required=plan["approval_required"],
+                simulation=plan["simulation"],
+            )
+            created_actions += 1
+
+            jlog("incident_created", session["sub"], {
+                "incident_id": incident_id,
+                "service": incident["service"],
+                "incident_type": incident["incident_type"],
+                "severity": incident["severity"],
+                "recommended_action": action_type,
+            })
+
+    return {"status": "evaluated", "created_incidents": created_incidents, "created_actions": created_actions}
+
+@app.get("/incidents")
+def incidents(session: Dict = Depends(require_session)):
+    return list_incidents()
+
+@app.get("/actions")
+def actions(session: Dict = Depends(require_session)):
+    return list_actions()
+
+@app.post("/actions/{action_id}/approve")
+def action_approve(action_id: int, payload: ApprovalIn, session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "compliance_reviewer"])
+    update_action_approval(action_id, session["sub"], payload.decision, payload.comment)
+    if payload.decision == "rejected":
+        record_learning("unknown", "unknown", "unknown", "manual_override", 0.0, payload.comment)
+    jlog("action_reviewed", session["sub"], {"action_id": action_id, "decision": payload.decision, "comment": payload.comment})
+    return {"status": payload.decision}
+
+@app.post("/actions/{action_id}/execute")
+def action_execute(action_id: int, payload: ExecuteIn, session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    target = next((a for a in list_actions() if a["id"] == action_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Action not found")
+    if target["approval_required"] and target["approval_status"] != "approved" and not payload.force:
+        raise HTTPException(status_code=400, detail="Action requires approval")
+
+    result = get_executor().execute(target)
+    status = "executed" if result.get("success") else "failed"
+    update_action_execution(action_id, session["sub"], status, result)
+    ACTIONS_EXECUTED.labels(result=status).inc()
+
+    incident = next((i for i in list_incidents() if i["id"] == target["incident_id"]), None)
+    if incident:
+        record_learning(
+            service=incident["service"],
+            incident_type=incident["incident_type"],
+            action_type=target["action_type"],
+            outcome="success" if status == "executed" else "failure",
+            confidence=float(target["simulation"].get("confidence", 0.5)),
+            notes="interactive execution result",
+        )
+
+    if status == "executed":
+        close_incident(target["incident_id"])
+
+    jlog("action_executed", session["sub"], {"action_id": action_id, "status": status, "result": result})
+    return {"status": status, "result": result}
+
+@app.post("/actions/{action_id}/enqueue")
+def action_enqueue(action_id: int, session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    enqueue_action(action_id)
+    jlog("action_enqueued", session["sub"], {"action_id": action_id})
+    return {"status": "queued", "action_id": action_id}
+
+@app.post("/worker/process-once")
+def worker_process_once(session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator"])
+    return process_one_queue_item(session["sub"])
+
+@app.get("/learning/summary")
+def learning_summary(session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator", "compliance_reviewer"])
+    db = SessionLocal()
+    rows = db.query(LearningFeedback).all()
+    db.close()
+
+    if not rows:
+        return {"entries": 0, "success_rate": 0.0}
+
+    total = len(rows)
+    success = sum(1 for r in rows if r.outcome == "success")
+    return {
+        "entries": total,
+        "success_rate": round(success / total, 3),
+    }
+
+@app.get("/dashboard/summary")
+def dashboard_summary(session: Dict = Depends(require_session)):
+    inc = list_incidents()
+    act = list_actions()
+    tele = fetch_recent_telemetry()
+
+    return {
+        "total_incidents": len(inc),
+        "open_incidents": sum(1 for i in inc if i["status"] in ["open", "under_review"]),
+        "high_incidents": sum(1 for i in inc if i["severity"] == "high"),
+        "medium_incidents": sum(1 for i in inc if i["severity"] == "medium"),
+        "low_incidents": sum(1 for i in inc if i["severity"] == "low"),
+        "total_actions": len(act),
+        "approved_actions": sum(1 for a in act if a["approval_status"] == "approved"),
+        "pending_actions": sum(1 for a in act if a["approval_status"] == "pending"),
+        "executed_actions": sum(1 for a in act if a["execution_status"] == "executed"),
+        "failed_actions": sum(1 for a in act if a["execution_status"] == "failed"),
+        "services_monitored": int(tele["service"].nunique()) if not tele.empty else 0,
+    }
+
+@app.get("/dashboard/charts")
+def dashboard_charts(session: Dict = Depends(require_session)):
+    df = fetch_recent_telemetry()
+    if df.empty:
+        return {"cpu_percent": [], "error_rate": [], "latency_ms": []}
+
+    df["ts"] = pd.to_datetime(df["ts"])
+    out = {}
+    for metric in ["cpu_percent", "error_rate", "latency_ms"]:
+        out[metric] = df[df["metric_name"] == metric][["ts", "service", "metric_value"]].to_dict(orient="records")
+    return out
+
+@app.post("/gitops/argocd/sync")
+def gitops_argocd_sync(session: Dict = Depends(require_session)):
+    require_roles(session, ["admin", "operator"])
+    if not ARGOCD_ENABLED:
+        return {"status": "dry_run", "message": f"Would sync ArgoCD app {ARGOCD_APP} on {ARGOCD_SERVER}"}
+    try:
+        proc = subprocess.run(["argocd", "app", "sync", ARGOCD_APP, "--server", ARGOCD_SERVER], capture_output=True, text=True, check=True)
+        jlog("argocd_sync", session["sub"], {"app": ARGOCD_APP, "stdout": proc.stdout})
+        return {"status": "executed", "stdout": proc.stdout, "stderr": proc.stderr}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail={"stdout": e.stdout, "stderr": e.stderr})
+EOF
+
+cat > frontend/Home.py <<'EOF'
+import os
+import pandas as pd
+import requests
+import streamlit as st
+
+BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
+
+def api_get(path, token="", params=None, timeout=60):
+    headers = {"X-Session-Token": token} if token else {}
+    return requests.get(f"{BACKEND_URL}{path}", headers=headers, params=params or {}, timeout=timeout)
+
+def api_post(path, token="", body=None, timeout=120):
+    headers = {"X-Session-Token": token} if token else {}
+    return requests.post(f"{BACKEND_URL}{path}", headers=headers, json=body or {}, timeout=timeout)
+
+st.set_page_config(page_title="Level 6 Enterprise Control Plane", layout="wide")
+st.title("Level 6 Enterprise Control Plane")
+st.caption("Governance • learning • simulation • abstraction • queue • telemetry • observability")
+
+if "token" not in st.session_state:
+    st.session_state["token"] = ""
+if "user" not in st.session_state:
+    st.session_state["user"] = ""
+if "role" not in st.session_state:
+    st.session_state["role"] = ""
+
+with st.sidebar:
+    user = st.selectbox("Login", ["admin", "reviewer", "operator", "viewer"])
+    if st.button("Login"):
+        r = requests.get(f"{BACKEND_URL}/auth/login/{user}", timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            st.session_state["token"] = data["token"]
+            st.session_state["user"] = data["user"]
+            st.session_state["role"] = data["role"]
+        else:
+            st.error(r.text)
+
+    if st.session_state["token"]:
+        st.success(f"{st.session_state['user']} ({st.session_state['role']})")
+
+token = st.session_state["token"]
+if not token:
+    st.stop()
+
+tabs = st.tabs(["Overview", "Telemetry", "Governance", "Learning", "Boardroom"])
+
+with tabs[0]:
+    health = api_get("/health", token=token)
+    if health.status_code == 200:
+        st.json(health.json())
+
+    summary = api_get("/dashboard/summary", token=token)
+    if summary.status_code == 200:
+        s = summary.json()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Open Incidents", s["open_incidents"])
+        c2.metric("High Incidents", s["high_incidents"])
+        c3.metric("Pending Actions", s["pending_actions"])
+        c4.metric("Executed Actions", s["executed_actions"])
+
+    a1, a2 = st.columns(2)
+    with a1:
+        if st.button("Generate Sample Telemetry", use_container_width=True):
+            st.write(api_post("/telemetry/sample", token=token).json())
+    with a2:
+        if st.button("Run Control Plane Evaluation", use_container_width=True):
+            st.write(api_post("/autonomous/evaluate", token=token).json())
+
+with tabsc1, c2, c3 = st.columns(3)
+    with c1:
+        service = st.text_input("Service", value="orders-api")
+    with c2:
+        metric_name = st.selectbox("Metric", ["cpu_percent", "error_rate", "latency_ms"])
+    with c3:
+        metric_value = st.number_input("Metric value", value=90.0)
+
+    if st.button("Send Telemetry", use_container_width=True):
+        st.write(api_post("/telemetry", token=token, body={
+            "service": service,
+            "metric_name": metric_name,
+            "metric_value": metric_value
+        }).json())
+
+    recent = api_get("/telemetry/recent", token=token)
+    if recent.status_code == 200:
+        df = pd.DataFrame(recent.json())
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+with tabs[2]:
+    inc = api_get("/incidents", token=token)
+    act = api_get("/actions", token=token)
+
+    if inc.status_code == 200:
+        st.subheader("Incidents")
+        inc_df = pd.DataFrame(inc.json())
+        st.dataframe(inc_df, use_container_width=True, hide_index=True)
+
+    if act.status_code == 200:
+        st.subheader("Actions")
+        act_df = pd.DataFrame(act.json())
+        st.dataframe(act_df, use_container_width=True, hide_index=True)
+
+        if not act_df.empty:
+            action_id = st.selectbox("Select action ID", act_df["id"].tolist())
+            r1, r2, r3, r4 = st.columns(4)
+
+            with r1:
+                if st.button("Approve", use_container_width=True):
+                    st.write(api_post(f"/actions/{action_id}/approve", token=token, body={"decision": "approved", "comment": "Approved from UI"}).json())
+            with r2:
+                if st.button("Reject", use_container_width=True):
+                    st.write(api_post(f"/actions/{action_id}/approve", token=token, body={"decision": "rejected", "comment": "Rejected from UI"}).json())
+            with r3:
+                if st.button("Execute", use_container_width=True):
+                    st.write(api_post(f"/actions/{action_id}/execute", token=token, body={"force": False}).json())
+            with r4:
+                if st.button("Queue", use_container_width=True):
+                    st.write(api_post(f"/actions/{action_id}/enqueue", token=token).json())
+
+with tabs[3]:
+    learn = api_get("/learning/summary", token=token)
+    if learn.status_code == 200:
+        st.subheader("Learning Summary")
+        st.json(learn.json())
+
+with tabs[4]:
+    summary = api_get("/dashboard/summary", token=token)
+    charts = api_get("/dashboard/charts", token=token)
+
+    if summary.status_code == 200:
+        s = summary.json()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Services", s["services_monitored"])
+        m2.metric("Incidents", s["total_incidents"])
+        m3.metric("Actions", s["total_actions"])
+        m4.metric("Approved", s["approved_actions"])
+
+    if charts.status_code == 200:
+        payload = charts.json()
+        for metric in ["cpu_percent", "error_rate", "latency_ms"]:
+            df = pd.DataFrame(payload.get(metric, []))
+            if not df.empty:
+                df["ts"] = pd.to_datetime(df["ts"])
+                st.markdown(f"**{metric}**")
+                st.line_chart(df.pivot(index="ts", columns="service", values="metric_value"))
+
+    if st.button("Sync ArgoCD App", use_container_width=True):
+        st.write(api_post("/gitops/argocd/sync", token=token).json())
+
+    if st.button("Process One Queue Item", use_container_width=True):
+        st.write(api_post("/worker/process-once", token=token).json())
+EOF
+
+cat > scripts/start_backend.sh <<'EOF'
+#!/usr/bin/env bash
+docker compose up --build backend
+EOF
+
+cat > scripts/start_frontend.sh <<'EOF'
+#!/usr/bin/env bash
+docker compose up --build frontend
+EOF
+
+cat > scripts/worker_loop.sh <<'EOF'
+#!/usr/bin/env python3
+import time
+import requests
+
+while True:
+    try:
+        r = requests.get("http://backend:8000/auth/login/operator", timeout=30)
+        token = r.json()["token"]
+        requests.post(
+            "http://backend:8000/worker/process-once",
+            headers={"X-Session-Token": token},
+            json={},
+            timeout=30,
+        )
+    except Exception:
+        pass
+    time.sleep(5)
+EOF
+
+cat > scripts/package.sh <<'EOF'
+#!/usr/bin/env bash
+tar -czf level6-control-plane.tar.gz .
+echo "created level6-control-plane.tar.gz"
+EOF
+
+chmod +x scripts/start_backend.sh scripts/start_frontend.sh scripts/worker_loop.sh scripts/package.sh
+
+cat > Dockerfile <<'EOF'
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r /app/requirements.txt
+
+COPY backend /app/backend
+COPY frontend /app/frontend
+COPY scripts /app/scripts
+COPY .env /app/.env
+
+RUN mkdir -p /app/logs /app/data && chmod +x /app/scripts/worker_loop.sh
+
+EXPOSE 8000 8501
+EOF
+
+cat > docker-compose.yml <<'EOF'
+services:
+  postgres:
+    image: postgres:16
+    container_name: level6-postgres
+    environment:
+      POSTGRES_USER: autonomous
+      POSTGRES_PASSWORD: autonomous
+      POSTGRES_DB: autonomous
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: level6-redis
+    ports:
+      - "6379:6379"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: level6-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: level6-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  backend:
+    build: .
+    container_name: level6-backend
+    env_file:
+      - .env
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+  frontend:
+    build: .
+    container_name: level6-frontend
+    env_file:
+      - .env
+    command: streamlit run frontend/Home.py --server.port 8501 --server.address 0.0.0.0
+    depends_on:
+      - backend
+    ports:
+      - "8501:8501"
+
+  worker:
+    build: .
+    container_name: level6-worker
+    env_file:
+      - .env
+    command: python /app/scripts/worker_loop.sh
+    depends_on:
+      - backend
+      - redis
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: level6-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - backend
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    container_name: level6-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+EOF
+
+cat > prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: level6-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['backend:8000']
+EOF
+
+cat > k8s/deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: level6-control-plane
+  labels:
+    app: level6-control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: level6-control-plane
+  template:
+    metadata:
+      labels:
+        app: level6-control-plane
+    spec:
+      containers:
+      - name: backend
+        image: level6-control-plane:latest
+        command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+        ports:
+        - containerPort: 8000
+      - name: frontend
+        image: level6-control-plane:latest
+        command: ["streamlit", "run", "frontend/Home.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+        ports:
+        - containerPort: 8501
+EOF
+
+cat > k8s/service.yaml <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: level6-control-plane
+  labels:
+    app: level6-control-plane
+spec:
+  selector:
+    app: level6-control-plane
+  ports:
+  - name: metrics
+    port: 8000
+    targetPort: 8000
+  - name: web
+    port: 8501
+    targetPort: 8501
+EOF
+
+cat > k8s/hpa.yaml <<'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: level6-control-plane-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: level6-control-plane
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+EOF
+
+cat > k8s/servicemonitor.yaml <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: level6-control-plane
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: level6-control-plane
+  namespaceSelector:
+    any: true
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 30s
+EOF
+
+cat > argo/application.yaml <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: level6-control-plane
+  namespace: argocd
+spec:
+  destination:
+    namespace: default
+    server: https://kubernetes.default.svc
+  source:
+    repoURL: https://github.com/example/level6-control-plane
+    path: k8s
+    targetRevision: HEAD
+  project: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+
+echo
+echo "READY: $ROOT"
+echo "START: cd \"$ROOT\" && docker compose up --build"
+echo "FRONTEND: http://127.0.0.1:8501"
+echo "BACKEND:  http://127.0.0.1:8000"
+echo "PROMETHEUS: http://127.0.0.1:9090"
+echo "GRAFANA: http://127.0.0.1:3000"
+
+Start
+cd "$HOME/level6-control-plane"
+docker compose up --build
+
+5 slides
+Slide 1 — Problem
+
+Modern platforms generate more telemetry and incident complexity than manual operations can safely handle.
+Threshold-only alerting reacts too late and drives expensive human toil.
+Enterprises need autonomy without losing governance.
+
+Slide 2 — Level 6 Control Plane
+
+The platform ingests telemetry, detects anomalies, creates incidents, simulates actions, and executes policy-bound remediation.
+Governance decides what can auto-run and what requires approval.
+Learning continuously improves action selection using past outcomes.
+
+Slide 3 — Safety Architecture
+
+Governance layer applies approval gates and policy checks.
+Simulation layer predicts post-action risk before execution.
+Abstraction layer decouples decision logic from execution targets such as Kubernetes and GitOps.
+
+Slide 4 — Enterprise Stack
+
+FastAPI backend, PostgreSQL for durable state, Redis for async execution, Kafka for telemetry streaming.
+Prometheus and Grafana provide observability and operational trust.
+Streamlit gives operators a direct control plane UI.
+
+Slide 5 — Business Impact
+
+Faster MTTR through simulation-driven, queue-backed remediation.
+Lower operational toil through controlled autonomy.
+Higher enterprise confidence with approvals, logs, metrics, and continuous learning.
+
+
+30-second sales pitch
+“Most operations platforms can either automate or govern, but not both.
+This Level 6 enterprise control plane does both by combining governance, simulation, learning, and abstraction into one autonomous decision system.
+It ingests telemetry, detects anomalies, simulates the safest remediation, routes approvals when needed, and learns from every outcome to improve the next decision.
+The result is faster recovery, lower manual toil, and a production-ready path to safe, explainable enterprise autonomy.”
+
+
+ONE-CLICK INSTALLER (PASTE THIS ON FRESH UBUNTU VM)
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "🚀 Starting Level 6 Control Plane Setup..."
+
+# -------------------------------
+# Install base dependencies
+# -------------------------------
+sudo apt update -y
+sudo apt install -y git curl unzip build-essential python3 python3-venv python3-pip
+
+# -------------------------------
+# Install Docker
+# -------------------------------
+if ! command -v docker &> /dev/null; then
+  echo "🐳 Installing Docker..."
+  curl -fsSL https://get.docker.com | bash
+  sudo usermod -aG docker $USER
+fi
+
+# -------------------------------
+# Install Docker Compose
+# -------------------------------
+if ! command -v docker-compose &> /dev/null; then
+  echo "🐳 Installing Docker Compose..."
+  sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+  sudo chmod +x /usr/local/bin/docker-compose
+fi
+
+# -------------------------------
+# Create project directory
+# -------------------------------
+ROOT="$HOME/level6-control-plane"
+rm -rf "$ROOT"
+mkdir -p "$ROOT"
+cd "$ROOT"
+
+echo "📁 Creating project structure..."
+
+mkdir -p backend frontend scripts k8s argo logs data
+
+# -------------------------------
+# Write requirements.txt
+# -------------------------------
+cat > requirements.txt <<'EOF'
+fastapi
+uvicorn
+streamlit
+requests
+pandas
+numpy
+prometheus-client
+PyJWT
+python-multipart
+SQLAlchemy
+psycopg2-binary
+redis
+kafka-python
+EOF
+
+# -------------------------------
+# Write .env
+# -------------------------------
+cat > .env <<'EOF'
+ENV=production
+BACKEND_URL=http://backend:8000
+
+SESSION_SECRET=level6-control-plane-secret
+SESSION_EXP_MINUTES=480
+
+AUTO_APPROVE_LOW=true
+ENABLE_REAL_REMEDIATION=false
+DEFAULT_NAMESPACE=default
+
+CPU_THRESHOLD=85
+ERROR_RATE_THRESHOLD=5
+LATENCY_MS_THRESHOLD=1500
+
+DATABASE_URL=postgresql+psycopg2://autonomous:autonomous@postgres:5432/autonomous
+REDIS_URL=redis://redis:6379/0
+
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_TOPIC_TELEMETRY=autonomous-telemetry
+
+ARGOCD_ENABLED=false
+
+STRUCTURED_LOG_FILE=logs/app.jsonl
+EOF
+
+# -------------------------------
+# Minimal Backend
+# -------------------------------
+cat > backend/main.py <<'EOF'
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"app": "L6 Control Plane Ready"}
+EOF
+
+# -------------------------------
+# Minimal Frontend
+# -------------------------------
+cat > frontend/Home.py <<'EOF'
+import streamlit as st
+st.title("✅ Level 6 Control Plane Running")
+EOF
+
+# -------------------------------
+# Dockerfile
+# -------------------------------
+cat > Dockerfile <<'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install -r requirements.txt
+COPY backend /app/backend
+COPY frontend /app/frontend
+COPY .env /app/.env
+RUN mkdir -p /app/logs /app/data
+EOF
+
+# -------------------------------
+# docker-compose.yml
+# -------------------------------
+cat > docker-compose.yml <<'EOF'
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: autonomous
+      POSTGRES_PASSWORD: autonomous
+      POSTGRES_DB: autonomous
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+  backend:
+    build: .
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: .
+    command: streamlit run frontend/Home.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+EOF
+
+# -------------------------------
+# Make scripts executable
+# -------------------------------
+chmod -R 755 .
+
+echo "✅ Installation complete"
+echo "👉 Run this after relogin:"
+echo "cd $ROOT && docker compose up --build"
+echo ""
+echo "🌐 Access:"
+echo "Frontend → http://localhost:8501"
+echo "Backend  → http://localhost:8000"
+
+HOW TO USE
+Step 1: Paste into terminal
+nano install.sh
+# paste script
+chmod +x install.sh
+./install.sh
+
+Step 2: Apply docker group
+newgrp docker
+
+Step 3: Start platform
+cd ~/level6-control-plane
+docker compose up --build
+
+INAL DEMO PACKAGE (LEVEL 6)
+🧱 1. All Files List
+✅ Column View
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CategoryFilesCore Config.env, requirements.txt, Dockerfile, docker-compose.yml, prometheus.ymlBackendbackend/main.pyFrontendfrontend/Home.pyScriptsscripts/start_backend.sh, scripts/start_frontend.sh, scripts/worker_loop.sh, scripts/package.shKubernetesk8s/deployment.yaml, k8s/service.yaml, k8s/hpa.yaml, k8s/servicemonitor.yamlGitOpsargo/application.yamlStoragelogs/, data/
+
+✅ 📂 2. Folder Structure
+level6-control-plane/
+│
+├── .env
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── prometheus.yml
+│
+├── backend/
+│   └── main.py
+│
+├── frontend/
+│   └── Home.py
+│
+├── scripts/
+│   ├── start_backend.sh
+│   ├── start_frontend.sh
+│   ├── worker_loop.sh
+│   └── package.sh
+│
+├── k8s/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── hpa.yaml
+│   └── servicemonitor.yaml
+│
+├── argo/
+│   └── application.yaml
+│
+├── logs/
+└── data/
+
+3. requirements.txt
+fastapi
+uvicorn
+streamlit
+requests
+pandas
+numpy
+prometheus-client
+PyJWT
+python-multipart
+SQLAlchemy
+psycopg2-binary
+redis
+kafka-python
+
+4. .env
+ENV=production
+BACKEND_URL=http://backend:8000
+
+SESSION_SECRET=level6-control-plane-secret
+SESSION_EXP_MINUTES=480
+
+AUTO_APPROVE_LOW=true
+ENABLE_REAL_REMEDIATION=false
+DEFAULT_NAMESPACE=default
+
+CPU_THRESHOLD=85
+ERROR_RATE_THRESHOLD=5
+LATENCY_MS_THRESHOLD=1500
+
+DATABASE_URL=postgresql+psycopg2://autonomous:autonomous@postgres:5432/autonomous
+REDIS_URL=redis://redis:6379/0
+
+KAFKA_ENABLED=true
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_TOPIC_TELEMETRY=autonomous-telemetry
+
+ARGOCD_ENABLED=false
+ARGOCD_SERVER=http://argocd-server:8080
+ARGOCD_APP=policy-compare
+
+STRUCTURED_LOG_FILE=logs/app.jsonl
+
+5. Final TAR Packaging
+cd ~/level6-control-plane
+chmod +x scripts/package.sh
+./scripts/package.sh
+
+Manual Backup (Alternate)
+tar -czf level6-control-plane.tar.gz .
+
+
+FINAL DELIVERABLE SUMMARY
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CapabilityIncluded✅ Governance LayerPolicy-controlled approvals✅ Learning EngineFeedback-based optimization✅ Simulation LayerRisk + prediction before execution✅ Abstraction LayerExecution decoupled (K8s ready)✅ Queue SystemRedis async orchestration✅ ObservabilityPrometheus + Grafana✅ Event StreamingKafka✅ Enterprise DBPostgreSQL✅ GitOps ReadyArgoCD manifests✅ Kubernetes ReadyDeployment + HPA✅ UI Control PlaneStreamlit
+
